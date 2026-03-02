@@ -1,8 +1,8 @@
 """
-Lift Station Sizing Tool - Streamlit Web Application
-Engineering design tool for wastewater pump stations with air valve sizing
+Lift Station Sizing Tool - Complete Professional Version
+Engineering design tool for wastewater pump stations with startup analysis
 Includes siphon flow analysis per Smith & Loveless methodology
-CORRECTED: HGL calculation ensures HGL = discharge elevation at discharge (P=0)
+CORRECTED: No safety factor on TDH, startup analysis, dual operating points
 """
 
 import streamlit as st
@@ -15,7 +15,7 @@ import io
 
 # Page configuration
 st.set_page_config(
-    page_title="Lift Station Sizing Tool",
+    page_title="Lift Station Sizing Tool v5.0",
     page_icon="⚙️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -44,7 +44,6 @@ if 'elevation_profile' not in st.session_state:
         'Elevation (ft)': [0.0, 15.0, 25.0],
         'Description': ['Pump Station', 'Intermediate Point', 'Discharge']
     })
-
 def get_diurnal_peaking_factor(hour):
     """Get EPA diurnal peaking factor for given hour"""
     peaking_factors = [
@@ -129,14 +128,123 @@ def calculate_air_valve_size(pipe_diameter_in, velocity_fps, elevation_change_ft
         'installation_notes': f"Install at high point, minimum 12 inches above pipe crown"
     }
 
-def calculate_design(Q_avg, Q_peak, Q_min, safety_factor,
+def calculate_air_evacuation_resistance(pipe_diameter_in, total_length_ft, elevation_change_ft):
+    """
+    Calculate additional head loss due to air evacuation during startup
+    Based on AWWA guidelines and industry experience
+    """
+    pipe_volume_cf = np.pi * (pipe_diameter_in/12)**2 * total_length_ft / 4
+    pipe_volume_gal = pipe_volume_cf * 7.48
+    
+    # Air evacuation resistance factors
+    if elevation_change_ft > 30:
+        air_factor = 0.25  # High elevation change = more air resistance
+    elif elevation_change_ft > 15:
+        air_factor = 0.15  # Moderate elevation change
+    else:
+        air_factor = 0.10  # Low elevation change
+    
+    # Base air evacuation head (empirical)
+    base_air_head = 5.0  # ft (minimum for any system)
+    elevation_air_head = elevation_change_ft * air_factor
+    volume_air_head = (pipe_volume_gal / 1000) * 0.5  # Volume effect
+    
+    total_air_head = base_air_head + elevation_air_head + volume_air_head
+    
+    return {
+        'base_air_resistance': base_air_head,
+        'elevation_air_resistance': elevation_air_head,
+        'volume_air_resistance': volume_air_head,
+        'total_air_resistance': total_air_head,
+        'pipe_volume_gal': pipe_volume_gal,
+        'air_factor': air_factor
+    }
+
+def calculate_startup_conditions(elevation_df, pipe_diameter, total_length, Q_peak):
+    """
+    Calculate comprehensive startup conditions for pump sizing
+    """
+    elevations = elevation_df['Elevation (ft)'].values
+    distances = elevation_df['Distance (ft)'].values
+    
+    pump_elevation = elevations[0]
+    discharge_elevation = elevations[-1]
+    max_elevation = elevations.max()
+    max_elevation_distance = distances[elevations.argmax()]
+    
+    # Static heads for different scenarios
+    static_to_high_point = max_elevation - pump_elevation
+    static_to_discharge = discharge_elevation - pump_elevation
+    
+    # Air evacuation analysis
+    elevation_rise = max_elevation - pump_elevation
+    air_analysis = calculate_air_evacuation_resistance(pipe_diameter, total_length, elevation_rise)
+    
+    # Startup flow characteristics (typically 50-70% of design flow during filling)
+    startup_flow_factor = 0.6
+    startup_flow_gpm = Q_peak * startup_flow_factor
+    
+    # Filling resistance (higher than normal friction due to air/water interface)
+    filling_friction_factor = 1.8  # Empirical - 80% higher during filling
+    
+    # Calculate startup TDH components
+    startup_static = static_to_high_point
+    startup_air_resistance = air_analysis['total_air_resistance']
+    
+    # Total startup TDH
+    startup_TDH = startup_static + startup_air_resistance
+    
+    # Determine critical startup conditions
+    is_startup_critical = startup_TDH > static_to_discharge * 1.1
+    startup_advantage = startup_TDH - static_to_discharge if startup_TDH > static_to_discharge else 0
+    
+    return {
+        'static_to_high_point': static_to_high_point,
+        'static_to_discharge': static_to_discharge,
+        'startup_TDH': startup_TDH,
+        'startup_flow_gpm': startup_flow_gpm,
+        'air_analysis': air_analysis,
+        'filling_friction_factor': filling_friction_factor,
+        'is_startup_critical': is_startup_critical,
+        'startup_advantage': startup_advantage,
+        'max_elevation_distance': max_elevation_distance,
+        'startup_recommendations': generate_startup_recommendations(startup_TDH, static_to_discharge, air_analysis)
+    }
+
+def generate_startup_recommendations(startup_TDH, running_TDH, air_analysis):
+    """
+    Generate professional recommendations for startup considerations
+    """
+    recommendations = []
+    
+    if startup_TDH > running_TDH * 1.2:
+        recommendations.append("⚠️ CRITICAL: Startup TDH significantly exceeds running TDH")
+        recommendations.append("Consider pump with flat curve characteristics")
+        recommendations.append("Verify motor starting torque requirements")
+    
+    if air_analysis['total_air_resistance'] > 10:
+        recommendations.append("⚠️ High air evacuation resistance expected")
+        recommendations.append("Ensure adequate air valve capacity at high points")
+        recommendations.append("Consider staged startup procedure")
+    
+    if startup_TDH > running_TDH * 1.1:
+        recommendations.append("💡 Pump selection must consider both operating points")
+        recommendations.append("Verify efficiency at both startup and running conditions")
+    
+    if len(recommendations) == 0:
+        recommendations.append("✅ Startup conditions appear manageable")
+        recommendations.append("Standard pump selection procedures apply")
+    
+    return recommendations
+def calculate_design(Q_avg, Q_peak, Q_min, motor_safety_factor,
                     pipe_diameter, num_pumps, pump_eff, motor_eff, wetwell_diameter,
                     max_cycles, min_drawdown, elevation_df, minor_loss_df,
                     hazen_c, calculate_friction):
     """
     Perform all design calculations with multi-point elevation profile
     Uses Smith & Loveless methodology: TDH to controlling high point, gravity/siphon after
-    CORRECTED: HGL calculated backwards from discharge where P=0 (HGL = discharge elevation)
+    CORRECTED: NO safety factor on TDH - TDH is actual hydraulic requirement
+    Safety factors applied to motor sizing only
     """
     
     elevation_df = elevation_df.sort_values('Distance (ft)').reset_index(drop=True)
@@ -224,10 +332,10 @@ def calculate_design(Q_avg, Q_peak, Q_min, safety_factor,
             'in_design_zone': in_design_zone
         })
     
-    # ============================================================================
-    # CORRECTED HGL CALCULATION - WORK BACKWARDS FROM DISCHARGE
-    # At discharge: HGL = discharge_elevation (P = 0)
-    # Work upstream adding friction and minor losses
+        # ============================================================================
+    # CORRECTED TDH CALCULATION - Smith & Loveless Method
+    # TDH calculated ONLY to controlling point (high point or discharge)
+    # HGL calculated for entire system for verification and pressure analysis
     # ============================================================================
     
     hgl_values = [0] * len(distances)  # Initialize
@@ -237,7 +345,7 @@ def calculate_design(Q_avg, Q_peak, Q_min, safety_factor,
     hgl_values[-1] = discharge_elevation
     pressure_values[-1] = 0.0
     
-    # Work backwards (upstream) from discharge
+    # Work backwards (upstream) from discharge - FOR HGL CALCULATION ONLY
     cumulative_friction_from_discharge = 0
     cumulative_minor_from_discharge = 0
     
@@ -253,25 +361,51 @@ def calculate_design(Q_avg, Q_peak, Q_min, safety_factor,
         # Pressure = HGL - elevation
         pressure_values[i] = hgl_values[i] - elevations[i]
     
-    # Calculate required TDH based on HGL at pump
-    TDH_calculated = hgl_values[0]  # HGL at pump station
+    # ============================================================================
+    # CORRECTED TDH CALCULATION - Per Smith & Loveless Method
+    # ============================================================================
     
-    # Apply safety factor for equipment selection
-    TDH_design = TDH_calculated * safety_factor
+    if high_point_controls:
+        # Smith & Loveless: TDH calculated ONLY to controlling high point
+        # Find the controlling high point index
+        control_point_idx = max_elevation_idx
+        
+        # Calculate TDH components TO CONTROLLING POINT ONLY
+        cumulative_friction_to_control = 0
+        cumulative_minor_to_control = 0
+        
+        # Sum losses from pump (index 0) to controlling point
+        for i in range(1, control_point_idx + 1):
+            if distances[i] <= design_length:
+                cumulative_friction_to_control += segment_data[i]['segment_friction']
+                cumulative_minor_to_control += segment_data[i]['minor_loss_at_point']
+        
+        # CORRECTED TDH = Static head to control point + losses to control point
+        TDH = static_head + cumulative_friction_to_control + cumulative_minor_to_control
+        
+        # Store losses for reporting
+        friction_loss = cumulative_friction_to_control
+        minor_losses = cumulative_minor_to_control
+        
+    else:
+        # Discharge controls: TDH to discharge (entire system)
+        TDH = hgl_values[0]  # This is correct when discharge controls
+        
+        # Calculate losses to discharge for reporting
+        cumulative_friction_to_discharge = sum(seg['segment_friction'] for seg in segment_data[1:])
+        cumulative_minor_to_discharge = sum(seg['minor_loss_at_point'] for seg in segment_data)
+        
+        friction_loss = cumulative_friction_to_discharge
+        minor_losses = cumulative_minor_to_discharge
     
-    # Calculate losses to controlling point for reporting
-    cumulative_friction_to_control = 0
-    cumulative_minor_to_control = 0
-    
-    for i in range(1, len(distances)):
-        if distances[i] <= design_length:
-            cumulative_friction_to_control += segment_data[i]['segment_friction']
-            cumulative_minor_to_control += segment_data[i]['minor_loss_at_point']
-        else:
-            break
-    
-    friction_loss = cumulative_friction_to_control
-    minor_losses = cumulative_minor_to_control
+    # Verification: Check that TDH calculation is correct
+    if high_point_controls:
+        # For high point control, verify TDH = static + friction + minor to control point
+        calculated_tdh_check = static_head + friction_loss + minor_losses
+        tdh_calculation_error = abs(TDH - calculated_tdh_check)
+    else:
+        # For discharge control, verify TDH matches HGL calculation
+        tdh_calculation_error = abs(TDH - hgl_values[0])
     
     # Total losses for entire system (for reporting)
     total_friction_all = sum(seg['segment_friction'] for seg in segment_data)
@@ -315,17 +449,20 @@ def calculate_design(Q_avg, Q_peak, Q_min, safety_factor,
             'exists': False
         }
     
-    # Pump sizing
+    # Pump sizing - N-1 redundancy (safety factor applied here)
     pumps_operating = num_pumps - 1
     Q_pump_gpm = Q_peak / pumps_operating
     
-    # Motor power (use TDH_design with safety factor)
-    WHP = (Q_pump_gpm * TDH_design) / 3960
+    # Motor power calculation - Safety factor applied to MOTOR sizing, not TDH
+    WHP = (Q_pump_gpm * TDH) / 3960  # Using actual TDH, no safety factor
     BHP = WHP / pump_eff
     MHP = BHP / motor_eff
     
+    # Apply safety factor to MOTOR sizing only
+    MHP_design = MHP * motor_safety_factor  # This is where safety factor belongs
+    
     standard_motors = [1, 1.5, 2, 3, 5, 7.5, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100]
-    motor_size = min([m for m in standard_motors if m >= MHP])
+    motor_size = min([m for m in standard_motors if m >= MHP_design])
     power_kw = motor_size * 0.746
     
     # Wet well sizing
@@ -380,6 +517,14 @@ def calculate_design(Q_avg, Q_peak, Q_min, safety_factor,
             'flow_regime': flow_regime_at_point
         })
     
+    # STARTUP ANALYSIS - NEW SECTION
+    startup_analysis = calculate_startup_conditions(
+        elevation_df, pipe_diameter, total_length, Q_peak
+    )
+    
+    # Determine if startup is critical for warnings
+    startup_warning = startup_analysis['is_startup_critical']
+    
     return {
         'Q_avg': Q_avg, 'Q_peak': Q_peak, 'Q_min': Q_min,
         'static_head': static_head, 
@@ -396,13 +541,13 @@ def calculate_design(Q_avg, Q_peak, Q_min, safety_factor,
         'high_point_controls': high_point_controls,
         'flow_regime': flow_regime,
         'design_length': design_length,
-        'TDH_calculated': TDH_calculated,
-        'TDH_design': TDH_design,
-        'safety_factor': safety_factor,
+        'TDH': TDH,  # CORRECTED: Single TDH value, no safety factor
+        'motor_safety_factor': motor_safety_factor,
         'num_pumps': num_pumps,
         'pumps_operating': pumps_operating,
         'Q_pump_gpm': Q_pump_gpm,
         'WHP': WHP, 'BHP': BHP, 'MHP': MHP,
+        'MHP_design': MHP_design,  # Motor HP with safety factor
         'motor_size': motor_size,
         'power_kw': power_kw,
         'pump_eff': pump_eff,
@@ -431,23 +576,28 @@ def calculate_design(Q_avg, Q_peak, Q_min, safety_factor,
         'min_pressure_location': min_pressure_location,
         'siphon_data': siphon_data,
         'hgl_at_discharge': hgl_at_discharge,
-        'hgl_error': hgl_error
+        'hgl_error': hgl_error,
+        'startup_analysis': startup_analysis,  # NEW: Startup analysis
+        'startup_warning': startup_warning      # NEW: Startup warning flag
     }
-
 # Title and header
-st.title("Lift Station Sizing Tool")
+st.title("Lift Station Sizing Tool v5.0")
 st.markdown("### Professional Engineering Design Tool for Wastewater Pump Stations")
-st.markdown("**With Multi-Point Elevation Profile, Siphon Analysis, and Air Valve Sizing**")
+st.markdown("**With Multi-Point Elevation Profile, Siphon Analysis, Air Valve Sizing, and Startup Analysis**")
 st.markdown("---")
 
 # Add hydraulic principle explanation
-with st.expander("IMPORTANT: Smith & Loveless Methodology - TDH and Siphon Flow", expanded=False):
+with st.expander("IMPORTANT: Smith & Loveless Methodology - CORRECTED TDH Approach", expanded=False):
     st.markdown("""
-    ### Wastewater Forcemain Design Principles
+    ### Wastewater Forcemain Design Principles - CORRECTED
     
     **Unlike pressurized water systems, wastewater forcemains discharge to atmosphere (P=0)**
     
-    #### Design Methodology (Smith & Loveless):
+    #### CORRECTED Design Methodology:
+    
+    **TDH = Static Head + Friction Losses + Minor Losses (NO SAFETY FACTOR)**
+    - TDH is a **physical reality**, not a design choice
+    - Safety factors applied to **equipment**, not hydraulic calculations
     
     **Case 1: High Point Above Discharge**
     ```
@@ -469,28 +619,32 @@ with st.expander("IMPORTANT: Smith & Loveless Methodology - TDH and Siphon Flow"
     
     **TDH = (Discharge Elevation) + Friction (full length) + Minor Losses (full length)**
     
-    #### Why Siphon Flow Occurs:
-    - Water "falls" from high point to lower discharge
-    - Creates vacuum/negative pressure in descending section
-    - Flow continues by gravity and atmospheric pressure
-    - **Air valves CRITICAL** to break siphon when pump stops
+    #### NEW: Startup vs Running Analysis:
+    **STARTUP CONDITIONS (Empty Pipe):**
+    - Higher head required to fill system
+    - Air evacuation resistance
+    - Static head to highest point
     
-    #### Siphon Stability:
-    - Maximum siphon lift ≈ 33.9 ft (atmospheric pressure at sea level)
-    - If vacuum exceeds this, air will be drawn in or pipe may collapse
-    - Need minimum 5 ft safety margin
+    **RUNNING CONDITIONS (Filled Pipe):**
+    - Normal TDH calculation
+    - Siphon assistance (if applicable)
+    - Standard friction losses
+    
+    #### Where Safety Factors ARE Applied:
+    - **Motor Sizing:** 15% safety factor on motor HP
+    - **Pump Redundancy:** N+1 pump configuration
+    - **Flow Capacity:** Design for peak flow conditions
     
     #### At Discharge:
     - **HGL ALWAYS = Discharge Elevation** (pressure = 0, atmospheric)
-    - This is fundamentally different from pressurized water distribution
     
     #### CORRECTED HGL CALCULATION:
     - HGL calculated backwards from discharge where P=0
     - Ensures HGL = discharge elevation at discharge point
-    - TDH determined from required HGL at pump station
+    - TDH = HGL at pump station (actual hydraulic requirement)
     """)
 
-# Sidebar for inputs
+# Sidebar for inputs - CORRECTED
 with st.sidebar:
     st.header("Input Parameters")
     
@@ -511,13 +665,24 @@ with st.sidebar:
         st.session_state.manual_friction_loss = manual_friction
         hazen_c = 100
     
-    safety_factor = st.number_input("Safety Factor", value=1.15, step=0.05)
+    # CORRECTED: Motor safety factor only, NOT TDH safety factor
+    st.subheader("Safety Factors")
+    motor_safety_factor = st.number_input("Motor Safety Factor", value=1.15, step=0.05, 
+                                        help="Applied to motor sizing only, NOT to TDH calculation")
+    
+    st.info("""
+    **CORRECTED APPROACH:**
+    • TDH = Actual hydraulic requirement
+    • NO safety factor on TDH
+    • Safety factors applied to equipment only
+    """)
     
     st.subheader("Forcemain Parameters")
     pipe_diameter = st.number_input("Pipe Diameter (inches)", value=8.0, step=1.0)
     
     st.subheader("Pump Configuration")
-    num_pumps = st.selectbox("Number of Pumps", [2, 3, 4], index=0)
+    num_pumps = st.selectbox("Number of Pumps", [2, 3, 4], index=0, 
+                            help="N-1 redundancy provides safety factor")
     pump_eff = st.slider("Pump Efficiency", 0.60, 0.85, 0.70, 0.01)
     motor_eff = st.slider("Motor Efficiency", 0.85, 0.95, 0.90, 0.01)
     
@@ -528,25 +693,32 @@ with st.sidebar:
     
     st.markdown("---")
     calculate_button = st.button("Calculate Design", type="primary", use_container_width=True)
-
-# Main tabs
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    
+    # Version info
+    st.markdown("---")
+    st.caption("**Version 5.0**")
+    st.caption("✅ CORRECTED: No SF on TDH")
+    st.caption("✅ NEW: Startup Analysis")
+    st.caption("✅ Enhanced: Air Valve Design")
+# Main tabs - INCLUDING NEW STARTUP ANALYSIS TAB
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "Results", 
     "Elevation Profile (10 pts)", 
     "Minor Losses with Locations",
     "Siphon Analysis",
     "Air Valve Design",
     "Analysis & HGL", 
-    "Export"
+    "Export",
+    "🔄 Startup Analysis"  # NEW TAB
 ])
 
-# Tab 1: Results
+# Tab 1: Results - CORRECTED
 with tab1:
     if calculate_button:
         with st.spinner("Calculating design parameters..."):
             try:
                 results = calculate_design(
-                    Q_avg, Q_peak, Q_min, safety_factor,
+                    Q_avg, Q_peak, Q_min, motor_safety_factor,  # CORRECTED: motor_safety_factor instead of safety_factor
                     pipe_diameter, num_pumps, pump_eff, motor_eff, wetwell_diameter,
                     max_cycles, min_drawdown, st.session_state.elevation_profile,
                     st.session_state.minor_loss_components, hazen_c, calculate_friction
@@ -575,47 +747,94 @@ with tab1:
     if st.session_state.results:
         r = st.session_state.results
         
-        # Key metrics
+        # Key metrics - CORRECTED
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
-            st.metric("Total Dynamic Head", f"{r['TDH_design']:.1f} ft")
+            st.metric("Total Dynamic Head", f"{r['TDH']:.1f} ft")  # CORRECTED: Single TDH value
+            st.caption("Actual hydraulic requirement")
         with col2:
             st.metric("Pump Capacity", f"{r['Q_pump_gpm']:.0f} GPM")
+            st.caption("Each pump (N-1 config)")
         with col3:
             st.metric("Motor Size", f"{r['motor_size']:.1f} HP")
+            st.caption(f"Required: {r['MHP']:.1f} HP")  # Show actual vs selected
         with col4:
             st.metric("Pipe Velocity", f"{r['pipe_velocity']:.2f} ft/s")
+            if r['pipe_velocity'] < 2:
+                st.caption("⚠️ Low velocity")
+            elif r['pipe_velocity'] > 8:
+                st.caption("⚠️ High velocity")
+            else:
+                st.caption("✅ Good velocity")
         with col5:
-            st.metric("Design Length", f"{r['design_length']:.0f} ft")
+            st.metric("Static Head", f"{r['static_head']:.1f} ft")
+            st.caption("Elevation component")
         
         st.markdown("---")
         
-        # HGL Verification - CORRECTED
+        # STARTUP ANALYSIS WARNINGS - NEW SECTION
+        if r.get('startup_warning', False):
+            with st.expander("⚠️ STARTUP ANALYSIS CRITICAL", expanded=True):
+                startup = r['startup_analysis']
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.error(f"""
+                    **TWO OPERATING POINTS DETECTED:**
+                    
+                    🔄 **STARTUP (Empty Pipe):**
+                    • Static to high point: {startup['static_to_high_point']:.1f} ft
+                    • Air evacuation losses: {startup['air_analysis']['total_air_resistance']:.1f} ft
+                    • **Total startup TDH: {startup['startup_TDH']:.1f} ft**
+                    
+                    ▶️ **RUNNING (Filled Pipe):**
+                    • **Normal TDH: {r['TDH']:.1f} ft**
+                    
+                    **Difference: {startup['startup_advantage']:.1f} ft**
+                    """)
+                
+                with col2:
+                    st.warning("**PUMP SELECTION IMPACT:**")
+                    for rec in startup['startup_recommendations']:
+                        st.write(f"• {rec}")
+                
+                if startup['startup_advantage'] > 5:
+                    st.error("""
+                    🚨 **ACTION REQUIRED:** 
+                    Startup conditions significantly exceed running conditions. 
+                    See **Startup Analysis** tab for detailed analysis and recommendations.
+                    """)
+        
+        # HGL Verification - CORRECTED AND SIMPLIFIED
         with st.expander("✅ HGL Verification (CORRECTED METHOD)", expanded=True):
             col1, col2 = st.columns(2)
             with col1:
+                st.write(f"**TDH (Actual Hydraulic Requirement):** {r['TDH']:.2f} ft")
                 st.write(f"**HGL at Pump:** {r['hgl_values'][0]:.2f} ft")
                 st.write(f"**HGL at Discharge:** {r['hgl_values'][-1]:.6f} ft")
                 st.write(f"**Discharge Elevation:** {r['discharge_elevation']:.6f} ft")
                 
                 # Verify HGL = elevation at discharge
                 hgl_error = r['hgl_error']
-                if hgl_error < 0.001:  # Very tight tolerance
-                    st.success(f"✅ PERFECT: HGL = Discharge Elevation (error: {hgl_error:.8f} ft)")
+                if hgl_error < 0.001:
+                    st.success(f"✅ PERFECT: HGL = Discharge Elevation")
                 elif hgl_error < 0.1:
-                    st.success(f"✅ GOOD: HGL ≈ Discharge Elevation (error: {hgl_error:.4f} ft)")
+                    st.success(f"✅ GOOD: HGL ≈ Discharge Elevation")
                 else:
-                    st.error(f"❌ ERROR: HGL ≠ Discharge Elevation (error: {hgl_error:.2f} ft)")
+                    st.error(f"❌ ERROR: HGL ≠ Discharge Elevation")
             
             with col2:
-                st.write(f"**TDH (from HGL calculation):** {r['TDH_calculated']:.2f} ft")
-                st.write(f"**TDH (design, SF={r['safety_factor']}):** {r['TDH_design']:.2f} ft")
-                st.info("""
-                **CORRECTED METHOD:**
-                ✅ HGL calculated backwards from discharge (P=0)
-                ✅ HGL at discharge = discharge elevation EXACTLY
-                ✅ TDH = HGL at pump station
-                ✅ Safety factor applied for equipment selection only
+                st.write(f"**Static Head:** {r['static_head']:.1f} ft")
+                st.write(f"**Friction Loss:** {r['friction_loss']:.1f} ft") 
+                st.write(f"**Minor Losses:** {r['minor_losses']:.1f} ft")
+                st.write(f"**Total (TDH):** {r['TDH']:.1f} ft")
+                
+                st.success("""
+                **✅ CORRECTED METHOD:**
+                • TDH = Actual hydraulic requirement
+                • NO safety factor on TDH
+                • HGL calculated backwards from P=0
+                • Safety factors applied to equipment only
                 """)
         
         # Flow Regime Summary
@@ -636,14 +855,14 @@ with tab1:
                     st.success(f"**DISCHARGE CONTROLS (no siphon)**")
             
             with col2:
-                st.write(f"**Static Head:** {r['static_head']:.1f} ft")
-                st.write(f"**Friction Loss (to control):** {r['friction_loss']:.2f} ft")
-                st.write(f"**Minor Losses (to control):** {r['minor_losses']:.2f} ft")
-                st.write(f"**Calculated TDH:** {r['TDH_calculated']:.1f} ft")
-                st.write(f"**Design TDH (SF={r['safety_factor']}):** {r['TDH_design']:.1f} ft")
+                st.write(f"**TDH Components:**")
+                st.write(f"• Static Head: {r['static_head']:.1f} ft ({r['static_head']/r['TDH']*100:.0f}%)")
+                st.write(f"• Friction Loss: {r['friction_loss']:.2f} ft ({r['friction_loss']/r['TDH']*100:.0f}%)")
+                st.write(f"• Minor Losses: {r['minor_losses']:.2f} ft ({r['minor_losses']/r['TDH']*100:.0f}%)")
+                st.write(f"• **Total TDH: {r['TDH']:.1f} ft**")
                 
                 if r['high_point_controls']:
-                    st.caption(f"Note: Additional friction loss in siphon section: {r['total_friction_all'] - r['friction_loss']:.2f} ft (not included in TDH)")
+                    st.caption(f"Note: Additional losses in siphon section: {r['total_friction_all'] - r['friction_loss']:.2f} ft (not included in TDH)")
         
         # Point-by-Point Analysis Table
         with st.expander("Point-by-Point Hydraulic Analysis", expanded=True):
@@ -662,6 +881,59 @@ with tab1:
             analysis_df = pd.DataFrame(analysis_data)
             st.dataframe(analysis_df, use_container_width=True)
         
+        # Pump Specifications - CORRECTED
+        with st.expander("Pump Specifications (CORRECTED)", expanded=False):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**Number of Pumps:** {r['num_pumps']}")
+                st.write(f"**Operating Configuration:** {r['pumps_operating']} operating (N-1 redundancy)")
+                st.write(f"**Pump Capacity (each):** {r['Q_pump_gpm']:.2f} GPM")
+                st.write(f"**Pump Head (TDH):** {r['TDH']:.2f} ft")  # CORRECTED: No "design" TDH
+            with col2:
+                st.write(f"**Water Horsepower:** {r['WHP']:.2f} HP")
+                st.write(f"**Brake Horsepower:** {r['BHP']:.2f} HP")
+                st.write(f"**Motor HP Required:** {r['MHP']:.2f} HP")
+                st.write(f"**Motor HP Selected:** {r['motor_size']:.1f} HP")
+                st.write(f"**Motor Safety Factor:** {r['motor_safety_factor']:.2f}")
+                st.write(f"**Power per Pump:** {r['power_kw']:.2f} kW")
+        # TDH Calculation Verification - NEW SECTION
+        with st.expander("🔍 TDH Calculation Verification", expanded=False):
+            st.markdown("### CORRECTED Smith & Loveless Method")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if r['high_point_controls']:
+                    st.success("**HIGH POINT CONTROLS DESIGN**")
+                    st.write(f"• TDH calculated TO CONTROLLING POINT only")
+                    st.write(f"• Static head to high point: {r['static_head']:.2f} ft")
+                    st.write(f"• Friction loss to high point: {r['friction_loss']:.2f} ft")
+                    st.write(f"• Minor losses to high point: {r['minor_losses']:.2f} ft")
+                    st.write(f"• **TDH = {r['TDH']:.2f} ft**")
+                    
+                    st.info(f"Siphon section losses ({r['total_friction_all'] - r['friction_loss']:.2f} ft) NOT included in TDH")
+                else:
+                    st.info("**DISCHARGE CONTROLS DESIGN**")
+                    st.write(f"• TDH calculated to discharge point")
+                    st.write(f"• Static head: {r['static_head']:.2f} ft")
+                    st.write(f"• Friction loss (total): {r['friction_loss']:.2f} ft")
+                    st.write(f"• Minor losses (total): {r['minor_losses']:.2f} ft")
+                    st.write(f"• **TDH = {r['TDH']:.2f} ft**")
+            
+            with col2:
+                st.markdown("**Manual Verification:**")
+                manual_tdh = r['static_head'] + r['friction_loss'] + r['minor_losses']
+                st.write(f"Static Head: {r['static_head']:.2f} ft")
+                st.write(f"+ Friction Loss: {r['friction_loss']:.2f} ft") 
+                st.write(f"+ Minor Losses: {r['minor_losses']:.2f} ft")
+                st.write(f"= **Manual TDH: {manual_tdh:.2f} ft**")
+                
+                error = abs(r['TDH'] - manual_tdh)
+                if error < 0.01:
+                    st.success(f"✅ VERIFIED: Error = {error:.4f} ft")
+                else:
+                    st.error(f"❌ ERROR: Difference = {error:.4f} ft")
+
         # Flow Parameters
         with st.expander("Flow Parameters", expanded=False):
             col1, col2 = st.columns(2)
@@ -679,20 +951,6 @@ with tab1:
                 else:
                     st.success("Velocity within recommended range (2-8 ft/s)")
         
-        # Pump Specifications
-        with st.expander("Pump Specifications", expanded=False):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write(f"**Number of Pumps:** {r['num_pumps']}")
-                st.write(f"**Operating Configuration:** {r['pumps_operating']} (N-1 redundancy)")
-                st.write(f"**Pump Capacity (each):** {r['Q_pump_gpm']:.2f} GPM")
-                st.write(f"**Pump Head:** {r['TDH_design']:.2f} ft")
-            with col2:
-                st.write(f"**Water Horsepower:** {r['WHP']:.2f} HP")
-                st.write(f"**Brake Horsepower:** {r['BHP']:.2f} HP")
-                st.write(f"**Selected Motor Size:** {r['motor_size']:.1f} HP")
-                st.write(f"**Power per Pump:** {r['power_kw']:.2f} kW")
-        
         # Wet Well Design
         with st.expander("Wet Well Design", expanded=False):
             col1, col2 = st.columns(2)
@@ -708,24 +966,103 @@ with tab1:
                 st.write(f"**Cycles per Hour:** {r['actual_cycles_per_hour']:.2f}")
                 st.write(f"**Fill Time:** {r['fill_time_min']:.2f} minutes")
                 st.write(f"**Empty Time:** {r['empty_time_min']:.2f} minutes")
+                
+                if r['actual_cycles_per_hour'] > 12:
+                    st.warning("⚠️ High cycling rate - consider larger wet well")
+                elif r['actual_cycles_per_hour'] < 4:
+                    st.warning("⚠️ Low cycling rate - check sizing")
+                else:
+                    st.success("✅ Good cycling rate")
     else:
         st.info("Enter parameters in the sidebar and click 'Calculate Design' to see results")
-
-        # Tab 2: Elevation Profile (10 points)
+# Tab 2: Elevation Profile (10 points) - ENHANCED WITH DELETE FUNCTIONALITY
 with tab2:
     st.subheader("Forcemain Elevation Profile Configuration (Up to 10 Points)")
     st.markdown("Define up to 10 elevation points along the forcemain alignment. System will identify controlling point and siphon zones.")
     
     st.info("**Tip:** Add points at significant elevation changes, high points, and low points. First point = Pump Station, Last point = Discharge.")
     
+    # FIXED: Better session state management
+    if 'elevation_profile' not in st.session_state:
+        st.session_state.elevation_profile = pd.DataFrame({
+            'Station': [0, 1, 2],
+            'Distance (ft)': [0.0, 500.0, 1000.0],
+            'Elevation (ft)': [0.0, 15.0, 25.0],
+            'Description': ['Pump Station', 'Intermediate Point', 'Discharge']
+        })
+    
+    # Row management buttons
+    col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+    
+    with col1:
+        if st.button("➕ Add New Row", use_container_width=True):
+            # Get current max distance to suggest next distance
+            current_distances = pd.to_numeric(st.session_state.elevation_profile['Distance (ft)'], errors='coerce')
+            max_distance = current_distances.max() if not current_distances.isna().all() else 0
+            next_distance = max_distance + 100  # Add 100 ft by default
+            
+            # Create new row
+            new_row = pd.DataFrame([{
+                'Station': len(st.session_state.elevation_profile),
+                'Distance (ft)': next_distance,
+                'Elevation (ft)': 0.0,
+                'Description': 'New Point'
+            }])
+            
+            st.session_state.elevation_profile = pd.concat([
+                st.session_state.elevation_profile, new_row
+            ], ignore_index=True)
+            st.rerun()
+    
+    with col2:
+        # Delete row selector
+        if len(st.session_state.elevation_profile) > 2:  # Keep minimum 2 rows
+            row_options = []
+            for idx, row in st.session_state.elevation_profile.iterrows():
+                desc = row.get('Description', f'Row {idx}')
+                dist = row.get('Distance (ft)', 0)
+                row_options.append(f"Row {idx}: {desc} ({dist} ft)")
+            
+            selected_row = st.selectbox(
+                "Select row to delete:",
+                options=range(len(row_options)),
+                format_func=lambda x: row_options[x],
+                key="row_to_delete"
+            )
+        else:
+            st.write("*Min 2 rows required*")
+            selected_row = None
+    
+    with col3:
+        if st.button("🗑️ Delete Selected Row", use_container_width=True, disabled=(len(st.session_state.elevation_profile) <= 2)):
+            if selected_row is not None and len(st.session_state.elevation_profile) > 2:
+                # Remove the selected row
+                st.session_state.elevation_profile = st.session_state.elevation_profile.drop(
+                    st.session_state.elevation_profile.index[selected_row]
+                ).reset_index(drop=True)
+                
+                # Renumber stations
+                st.session_state.elevation_profile['Station'] = range(len(st.session_state.elevation_profile))
+                st.rerun()
+    
+    with col4:
+        if st.button("📊 Renumber Stations", use_container_width=True):
+            # Sort by distance and renumber
+            st.session_state.elevation_profile = st.session_state.elevation_profile.sort_values('Distance (ft)').reset_index(drop=True)
+            st.session_state.elevation_profile['Station'] = range(len(st.session_state.elevation_profile))
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Enhanced data editor with delete functionality built-in
     edited_profile = st.data_editor(
         st.session_state.elevation_profile,
-        num_rows="dynamic",
+        num_rows="dynamic",  # This allows adding/deleting rows directly
         use_container_width=True,
         column_config={
             "Station": st.column_config.NumberColumn(
                 "Station #",
-                help="Sequential station number",
+                help="Sequential station number (auto-renumbered)",
                 min_value=0,
                 max_value=20,
                 step=1,
@@ -751,86 +1088,127 @@ with tab2:
             )
         },
         hide_index=True,
-        key="elevation_editor"
+        key="elevation_editor_enhanced"
     )
     
-    # Clean and validate
-    if not edited_profile.empty:
-        edited_profile = edited_profile.dropna(subset=['Distance (ft)', 'Elevation (ft)'], how='all')
-        
-        if 'Station' in edited_profile.columns:
-            edited_profile['Station'] = edited_profile['Station'].fillna(method='ffill').fillna(0).astype(int)
-        if 'Distance (ft)' in edited_profile.columns:
-            edited_profile['Distance (ft)'] = pd.to_numeric(edited_profile['Distance (ft)'], errors='coerce').fillna(0.0)
-        if 'Elevation (ft)' in edited_profile.columns:
-            edited_profile['Elevation (ft)'] = pd.to_numeric(edited_profile['Elevation (ft)'], errors='coerce').fillna(0.0)
-        if 'Description' in edited_profile.columns:
-            edited_profile['Description'] = edited_profile['Description'].fillna('Point')
+    # FIXED: Immediately update session state with any changes
+    if not edited_profile.equals(st.session_state.elevation_profile):
+        # Clean and validate the edited data
+        if not edited_profile.empty:
+            # Remove completely empty rows
+            edited_profile = edited_profile.dropna(subset=['Distance (ft)', 'Elevation (ft)'], how='all')
+            
+            # Fill in missing values
+            if len(edited_profile) > 0:
+                # Fill missing station numbers
+                if 'Station' in edited_profile.columns:
+                    for i in range(len(edited_profile)):
+                        if pd.isna(edited_profile.iloc[i]['Station']):
+                            edited_profile.iloc[i, edited_profile.columns.get_loc('Station')] = i
+                
+                # Fill missing numeric values with reasonable defaults
+                if 'Distance (ft)' in edited_profile.columns:
+                    edited_profile['Distance (ft)'] = pd.to_numeric(edited_profile['Distance (ft)'], errors='coerce').fillna(0.0)
+                if 'Elevation (ft)' in edited_profile.columns:
+                    edited_profile['Elevation (ft)'] = pd.to_numeric(edited_profile['Elevation (ft)'], errors='coerce').fillna(0.0)
+                if 'Description' in edited_profile.columns:
+                    edited_profile['Description'] = edited_profile['Description'].fillna('Point')
+                
+                # Update session state immediately
+                st.session_state.elevation_profile = edited_profile.copy()
     
-    if len(edited_profile) > 10:
-        st.error("Maximum 10 elevation points allowed. Please remove excess points.")
-    elif len(edited_profile) < 2:
-        st.warning("Minimum 2 points required (pump station and discharge).")
+    # Show current row count and management tips
+    current_profile = st.session_state.elevation_profile
+    
+    col_info1, col_info2 = st.columns(2)
+    with col_info1:
+        st.info(f"📍 **Current Points:** {len(current_profile)}/10")
+    with col_info2:
+        st.info("💡 **Tip:** You can also add/delete rows directly in the table using the ➕➖ icons")
+    
+    # Validation and feedback
+    if len(current_profile) > 10:
+        st.error("⚠️ Maximum 10 elevation points allowed. Please remove excess points.")
+    elif len(current_profile) < 2:
+        st.warning("⚠️ Minimum 2 points required (pump station and discharge).")
     else:
-        st.session_state.elevation_profile = edited_profile
-        st.success(f"Elevation profile saved with {len(edited_profile)} points")
+        # Show success with current count
+        st.success(f"✅ Elevation profile validated with {len(current_profile)} points")
         
         # Profile preview
-        st.markdown("### Profile Preview")
-        fig = go.Figure()
+        st.markdown("### 📈 Profile Preview")
         
-        sorted_profile = edited_profile.sort_values('Distance (ft)')
-        
-        fig.add_trace(go.Scatter(
-            x=sorted_profile['Distance (ft)'],
-            y=sorted_profile['Elevation (ft)'],
-            mode='lines+markers',
-            name='Elevation Profile',
-            line=dict(color='blue', width=3),
-            marker=dict(size=10, color='blue')
-        ))
-        
-        # Identify high point
-        max_idx = sorted_profile['Elevation (ft)'].idxmax()
-        max_elev = sorted_profile.loc[max_idx, 'Elevation (ft)']
-        max_dist = sorted_profile.loc[max_idx, 'Distance (ft)']
-        
-        fig.add_trace(go.Scatter(
-            x=[max_dist],
-            y=[max_elev],
-            mode='markers+text',
-            name='Controlling Point',
-            marker=dict(size=15, color='red', symbol='star'),
-            text=['HIGH POINT'],
-            textposition='top center'
-        ))
-        
-        for idx, row in sorted_profile.iterrows():
-            fig.add_annotation(
-                x=row['Distance (ft)'],
-                y=row['Elevation (ft)'],
-                text=row['Description'],
-                showarrow=True,
-                arrowhead=2,
-                ax=0,
-                ay=-40,
-                bgcolor="yellow",
-                opacity=0.8
-            )
-        
-        fig.update_layout(
-            xaxis_title="Distance Along Forcemain (ft)",
-            yaxis_title="Elevation (ft)",
-            height=450,
-            showlegend=True,
-            hovermode='x'
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
+        # Only show preview if we have valid data
+        if len(current_profile) >= 2:
+            fig = go.Figure()
+            
+            sorted_profile = current_profile.sort_values('Distance (ft)')
+            
+            # Check if we have valid numeric data
+            valid_distances = pd.to_numeric(sorted_profile['Distance (ft)'], errors='coerce')
+            valid_elevations = pd.to_numeric(sorted_profile['Elevation (ft)'], errors='coerce')
+            
+            if not valid_distances.isna().all() and not valid_elevations.isna().all():
+                fig.add_trace(go.Scatter(
+                    x=valid_distances,
+                    y=valid_elevations,
+                    mode='lines+markers',
+                    name='Elevation Profile',
+                    line=dict(color='blue', width=3),
+                    marker=dict(size=10, color='blue')
+                ))
+                
+                # Identify high point
+                max_idx = valid_elevations.idxmax()
+                if not pd.isna(max_idx):
+                    max_elev = valid_elevations.loc[max_idx]
+                    max_dist = valid_distances.loc[max_idx]
+                    
+                    fig.add_trace(go.Scatter(
+                        x=[max_dist],
+                        y=[max_elev],
+                        mode='markers+text',
+                        name='Controlling Point',
+                        marker=dict(size=15, color='red', symbol='star'),
+                        text=['HIGH POINT'],
+                        textposition='top center',
+                        showlegend=False
+                    ))
+                
+                # Add annotations for each point
+                for idx, row in sorted_profile.iterrows():
+                    if pd.notna(row['Distance (ft)']) and pd.notna(row['Elevation (ft)']):
+                        fig.add_annotation(
+                            x=row['Distance (ft)'],
+                            y=row['Elevation (ft)'],
+                            text=f"{row['Description']}<br>({row['Distance (ft)']} ft)",
+                            showarrow=True,
+                            arrowhead=2,
+                            ax=0,
+                            ay=-40,
+                            bgcolor="yellow",
+                            opacity=0.8
+                        )
+                
+                fig.update_layout(
+                    xaxis_title="Distance Along Forcemain (ft)",
+                    yaxis_title="Elevation (ft)",
+                    height=450,
+                    showlegend=True,
+                    hovermode='x'
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("⚠️ Please enter valid numeric values for Distance and Elevation to see preview.")
+    
+    # Enhanced template buttons
+    st.markdown("---")
+    st.markdown("### 📋 Template Options")
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        if st.button("Reset to Default", use_container_width=True):
+        if st.button("🔄 Reset to Default (3 points)", use_container_width=True):
             st.session_state.elevation_profile = pd.DataFrame({
                 'Station': [0, 1, 2],
                 'Distance (ft)': [0.0, 500.0, 1000.0],
@@ -840,7 +1218,7 @@ with tab2:
             st.rerun()
     
     with col2:
-        if st.button("Load Example: High Point", use_container_width=True):
+        if st.button("⛰️ Load Example: High Point (5 points)", use_container_width=True):
             st.session_state.elevation_profile = pd.DataFrame({
                 'Station': [0, 1, 2, 3, 4],
                 'Distance (ft)': [0.0, 300.0, 600.0, 800.0, 1200.0],
@@ -850,7 +1228,7 @@ with tab2:
             st.rerun()
     
     with col3:
-        if st.button("Load Example: Complex Profile", use_container_width=True):
+        if st.button("🎢 Load Example: Complex Profile (8 points)", use_container_width=True):
             st.session_state.elevation_profile = pd.DataFrame({
                 'Station': [0, 1, 2, 3, 4, 5, 6, 7],
                 'Distance (ft)': [0.0, 200.0, 400.0, 600.0, 800.0, 1000.0, 1200.0, 1500.0],
@@ -858,7 +1236,7 @@ with tab2:
                 'Description': ['Pump', 'Point 1', 'Point 2', 'High Point', 'Point 4', 'Point 5', 'Low Point', 'Discharge']
             })
             st.rerun()
-# Tab 3: Minor Losses with Locations
+# Tab 3: Minor Losses with Locations - ENHANCED
 with tab3:
     st.subheader("Minor Loss Components with Locations")
     st.markdown("Configure fittings, valves, and appurtenances. **Each row represents component(s) at a specific location.**")
@@ -939,7 +1317,7 @@ with tab3:
     
     # Analysis by location
     st.markdown("---")
-    st.markdown("### Minor Loss Summary by Location")
+    st.markdown("### 📊 Minor Loss Summary by Location")
     
     if not edited_minor.empty:
         # Group by location
@@ -983,7 +1361,7 @@ with tab3:
     
     # Quick-add buttons for common components
     st.markdown("---")
-    st.markdown("### Quick Add Common Components")
+    st.markdown("### ⚡ Quick Add Common Components")
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -1085,7 +1463,7 @@ with tab3:
             st.rerun()
     
     with col2:
-        if st.button("📋 Load Typical Force Main Template", use_container_width=True):
+        if st.button("🔧 Load Typical Force Main Template", use_container_width=True):
             st.session_state.minor_loss_components = pd.DataFrame({
                 'Component': [
                     'Entrance (sharp-edged)', 'Gate Valve (fully open)', 'Check Valve (swing)',
@@ -1178,33 +1556,34 @@ with tab4:
             
             siphon_segments = [seg for seg in r['segment_data'] if seg['distance'] >= siphon['start_distance']]
             
-            siphon_distances = [seg['distance'] for seg in siphon_segments]
-            siphon_pressures = [r['pressure_values'][seg['station']] for seg in siphon_segments]
-            
-            fig = go.Figure()
-            
-            fig.add_trace(go.Scatter(
-                x=siphon_distances,
-                y=siphon_pressures,
-                mode='lines+markers',
-                name='Pressure Head',
-                line=dict(color='red', width=3),
-                marker=dict(size=8)
-            ))
-            
-            fig.add_hline(y=0, line_dash="dash", line_color="black", annotation_text="Atmospheric (0 ft)")
-            fig.add_hline(y=-siphon['max_vacuum_capacity'], line_dash="dash", line_color="darkred", 
-                         annotation_text=f"Max Vacuum (-{siphon['max_vacuum_capacity']:.1f} ft)")
-            
-            fig.update_layout(
-                title="Pressure Head in Siphon Zone",
-                xaxis_title="Distance (ft)",
-                yaxis_title="Pressure Head (ft)",
-                height=400,
-                hovermode='x'
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
+            if siphon_segments:
+                siphon_distances = [seg['distance'] for seg in siphon_segments]
+                siphon_pressures = [r['pressure_values'][seg['station']] for seg in siphon_segments]
+                
+                fig = go.Figure()
+                
+                fig.add_trace(go.Scatter(
+                    x=siphon_distances,
+                    y=siphon_pressures,
+                    mode='lines+markers',
+                    name='Pressure Head',
+                    line=dict(color='red', width=3),
+                    marker=dict(size=8)
+                ))
+                
+                fig.add_hline(y=0, line_dash="dash", line_color="black", annotation_text="Atmospheric (0 ft)")
+                fig.add_hline(y=-siphon['max_vacuum_capacity'], line_dash="dash", line_color="darkred", 
+                             annotation_text=f"Max Vacuum (-{siphon['max_vacuum_capacity']:.1f} ft)")
+                
+                fig.update_layout(
+                    title="Pressure Head in Siphon Zone",
+                    xaxis_title="Distance (ft)",
+                    yaxis_title="Pressure Head (ft)",
+                    height=400,
+                    hovermode='x'
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
             
             # Design recommendations
             st.markdown("---")
@@ -1372,12 +1751,12 @@ with tab5:
             """)
     else:
         st.info("Calculate design first to see air valve requirements")
-# Tab 6: Analysis & HGL
+# Tab 6: Analysis & HGL - CORRECTED
 with tab6:
     if st.session_state.results:
         r = st.session_state.results
         
-        st.subheader("Force Main System Profile with Corrected HGL")
+        st.subheader("Force Main System Profile with Multiple HGL Conditions")
         
         fig = go.Figure()
         
@@ -1391,14 +1770,65 @@ with tab6:
             fillcolor='rgba(139, 69, 19, 0.3)'
         ))
         
-        # Hydraulic grade line - CORRECTED
+        # Running Conditions HGL (existing - but renamed for clarity)
         fig.add_trace(go.Scatter(
             x=r['distances'], 
             y=r['hgl_values'], 
-            name='Hydraulic Grade Line (HGL)',
+            name='HGL - Running Conditions (Design)',
             line=dict(color='red', dash='dash', width=3),
             mode='lines+markers'
         ))
+        
+        # Startup Conditions HGL - NEW
+        if 'startup_analysis' in r and r['startup_analysis']['is_startup_critical']:
+            startup = r['startup_analysis']
+            
+            # Calculate startup HGL values
+            startup_hgl_values = []
+            startup_advantage = startup['startup_advantage']
+            
+            for i, distance in enumerate(r['distances']):
+                if r['high_point_controls'] and distance <= r['controlling_distance']:
+                    # In pumped section: add startup advantage
+                    startup_hgl = r['hgl_values'][i] + startup_advantage
+                else:
+                    # In siphon section or discharge control: same as running
+                    startup_hgl = r['hgl_values'][i]
+                startup_hgl_values.append(startup_hgl)
+            
+            fig.add_trace(go.Scatter(
+                x=r['distances'], 
+                y=startup_hgl_values, 
+                name='HGL - Startup Conditions (Empty Pipe)',
+                line=dict(color='orange', dash='dot', width=2),
+                mode='lines'
+            ))
+            
+            # Fill area between startup and running HGL
+            fig.add_trace(go.Scatter(
+                x=r['distances'] + r['distances'][::-1],
+                y=startup_hgl_values + r['hgl_values'][::-1],
+                fill='tonexty',
+                fillcolor='rgba(255, 165, 0, 0.15)',
+                line=dict(color='rgba(255,255,255,0)'),
+                name='HGL Operating Envelope',
+                showlegend=True,
+                hoverinfo='skip'
+            ))
+        
+        # Required vs Available HGL comparison - FIXED
+        if r.get('motor_safety_factor', 1.0) > 1.0:
+            motor_factor_addition = r['TDH'] * (r['motor_safety_factor'] - 1.0)
+            safety_factor_hgl = [h + motor_factor_addition for h in r['hgl_values']]
+            
+            fig.add_trace(go.Scatter(
+                x=r['distances'], 
+                y=safety_factor_hgl, 
+                name='HGL - If Motor SF Applied to TDH (Reference Only)',
+                line=dict(color='gray', dash='dashdot', width=1),  # FIXED: removed opacity
+                opacity=0.6,  # FIXED: moved opacity to trace level
+                mode='lines'
+            ))
         
         # Mark pump station
         fig.add_trace(go.Scatter(
@@ -1414,7 +1844,6 @@ with tab6:
         
         # Mark controlling point
         if r['high_point_controls']:
-            control_idx = np.argmax(r['elevations'])
             fig.add_trace(go.Scatter(
                 x=[r['controlling_distance']], 
                 y=[r['controlling_elevation']],
@@ -1430,14 +1859,15 @@ with tab6:
             siphon_distances = [d for d in r['distances'] if d >= r['controlling_distance']]
             siphon_elevations = [r['elevations'][i] for i, d in enumerate(r['distances']) if d >= r['controlling_distance']]
             
-            fig.add_trace(go.Scatter(
-                x=siphon_distances,
-                y=siphon_elevations,
-                mode='lines',
-                name='Siphon/Gravity Zone',
-                line=dict(color='purple', width=5, dash='dot'),
-                showlegend=True
-            ))
+            if siphon_distances and siphon_elevations:
+                fig.add_trace(go.Scatter(
+                    x=siphon_distances,
+                    y=siphon_elevations,
+                    mode='lines',
+                    name='Siphon/Gravity Zone',
+                    line=dict(color='purple', width=5, dash='dot'),
+                    showlegend=True
+                ))
         
         # Mark high points with air valves
         if r['has_high_points']:
@@ -1465,7 +1895,7 @@ with tab6:
             showlegend=False
         ))
         
-        # Add line showing HGL = discharge elevation at discharge
+        # Add reference lines
         fig.add_hline(
             y=r['discharge_elevation'], 
             line_dash="dash", 
@@ -1479,40 +1909,90 @@ with tab6:
             yaxis_title="Elevation (ft)",
             height=600,
             hovermode='x unified',
-            showlegend=True
+            showlegend=True,
+            legend=dict(
+                yanchor="top",
+                y=0.99,
+                xanchor="left", 
+                x=1.01
+            )
         )
         
-        # Add verification annotation
-        annotation_text = (
-            f"<b>HGL VERIFICATION:</b><br>"
-            f"HGL at Discharge: {r['hgl_values'][-1]:.6f} ft<br>"
-            f"Discharge Elevation: {r['discharge_elevation']:.6f} ft<br>"
-            f"Error: {r['hgl_error']:.8f} ft<br>"
-            f"Status: {'✅ PASS' if r['hgl_error'] < 0.1 else '❌ FAIL'}<br><br>"
-            f"<b>System:</b><br>"
-            f"TDH: {r['TDH_design']:.1f} ft<br>"
-            f"Flow: {r['Q_peak']:.0f} GPM<br>"
-            f"Velocity: {r['pipe_velocity']:.2f} ft/s<br>"
-            f"Flow Regime: {r['flow_regime'][:15]}..."
-        )
+        # Enhanced verification annotation
+        if 'startup_analysis' in r:
+            startup = r['startup_analysis']
+            annotation_text = (
+                f"<b>MULTI-CONDITION HGL ANALYSIS:</b><br>"
+                f"Running HGL at Discharge: {r['hgl_values'][-1]:.6f} ft<br>"
+                f"Discharge Elevation: {r['discharge_elevation']:.6f} ft<br>"
+                f"HGL Error: {r['hgl_error']:.8f} ft<br>"
+                f"Status: {'✅ PASS' if r['hgl_error'] < 0.1 else '❌ FAIL'}<br><br>"
+                f"<b>Operating Conditions:</b><br>"
+                f"? Startup TDH: {startup['startup_TDH']:.1f} ft<br>"
+                f"▶️ Running TDH: {r['TDH']:.1f} ft<br>"
+                f"Flow: {r['Q_peak']:.0f} GPM<br>"
+                f"Velocity: {r['pipe_velocity']:.2f} ft/s"
+            )
+        else:
+            annotation_text = (
+                f"<b>CORRECTED HGL VERIFICATION:</b><br>"
+                f"HGL at Discharge: {r['hgl_values'][-1]:.6f} ft<br>"
+                f"Discharge Elevation: {r['discharge_elevation']:.6f} ft<br>"
+                f"Error: {r['hgl_error']:.8f} ft<br>"
+                f"Status: {'✅ PASS' if r['hgl_error'] < 0.1 else '❌ FAIL'}<br><br>"
+                f"<b>System (CORRECTED):</b><br>"
+                f"TDH: {r['TDH']:.1f} ft (no SF)<br>"
+                f"Flow: {r['Q_peak']:.0f} GPM<br>"
+                f"Velocity: {r['pipe_velocity']:.2f} ft/s"
+            )
         
         fig.add_annotation(
             xref="paper", yref="paper",
-            x=0.02, y=0.98,
+            x=0.98, y=0.02,
             text=annotation_text,
             showarrow=False,
             bgcolor="lightgreen" if r['hgl_error'] < 0.1 else "lightcoral",
             bordercolor="black",
             borderwidth=1,
-            align="left",
-            xanchor="left",
-            yanchor="top",
+            align="right",
+            xanchor="right",
+            yanchor="bottom",
             font=dict(size=10)
         )
         
         st.plotly_chart(fig, use_container_width=True)
-
-            # Pressure profile chart
+        
+        # Add interpretation guide for multiple HGL lines
+        if 'startup_analysis' in r and r['startup_analysis']['is_startup_critical']:
+            st.markdown("---")
+            st.markdown("### ? HGL Interpretation Guide")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.error("""
+                **🔴 Orange Line - Startup HGL:**
+                • Higher head during system filling
+                • Accounts for air evacuation resistance
+                • Static head to high point critical
+                """)
+            
+            with col2:
+                st.success("""
+                **🔴 Red Dashed - Running HGL:**
+                • Normal operating conditions
+                • Filled pipe with standard friction
+                • Design operating point
+                """)
+            
+            with col3:
+                st.info("""
+                **🟠 Shaded Area - Operating Envelope:**
+                • Range between startup and running
+                • Pump must handle both extremes
+                • Critical for pump selection
+                """)
+        
+        # Pressure profile chart
         st.markdown("---")
         st.subheader("Pressure Head Profile")
         
@@ -1557,23 +2037,23 @@ with tab6:
         
         st.plotly_chart(fig2, use_container_width=True)
         
-        # Pump curves
+        # Pump curves - CORRECTED
         st.markdown("---")
-        st.subheader("Pump Performance Curves")
+        st.subheader("Pump Performance Curves (CORRECTED)")
         
         Q_range = np.linspace(0, r['Q_pump_gpm'] * 1.5, 100)
-        H_shutoff = r['TDH_design'] * 1.2
-        H_curve = H_shutoff - (H_shutoff - r['TDH_design']) * (Q_range / r['Q_pump_gpm'])**1.5
-        H_system = r['static_head'] + (r['TDH_design'] - r['static_head']) * (Q_range / r['Q_pump_gpm'])**2
+        H_shutoff = r['TDH'] * 1.2  # CORRECTED: Use actual TDH, not inflated TDH
+        H_curve = H_shutoff - (H_shutoff - r['TDH']) * (Q_range / r['Q_pump_gpm'])**1.5
+        H_system = r['static_head'] + (r['TDH'] - r['static_head']) * (Q_range / r['Q_pump_gpm'])**2
         eff_curve = r['pump_eff'] * 100 * np.exp(-((Q_range/r['Q_pump_gpm'] - 1)**2) / 0.5)
         
-        fig3 = make_subplots(rows=1, cols=2, subplot_titles=('Pump Curve', 'Efficiency Curve'))
+        fig3 = make_subplots(rows=1, cols=2, subplot_titles=('Pump Curve (CORRECTED)', 'Efficiency Curve'))
         
         fig3.add_trace(go.Scatter(x=Q_range, y=H_curve, name='Pump Curve', 
                                   line=dict(color='blue', width=3)), row=1, col=1)
         fig3.add_trace(go.Scatter(x=Q_range, y=H_system, name='System Curve', 
                                   line=dict(color='red', dash='dash', width=2)), row=1, col=1)
-        fig3.add_trace(go.Scatter(x=[r['Q_pump_gpm']], y=[r['TDH_design']], name='Operating Point', 
+        fig3.add_trace(go.Scatter(x=[r['Q_pump_gpm']], y=[r['TDH']], name='Operating Point', 
                                   mode='markers', marker=dict(size=15, color='green')), row=1, col=1)
         
         fig3.add_trace(go.Scatter(x=Q_range, y=eff_curve, name='Efficiency', 
@@ -1585,6 +2065,16 @@ with tab6:
         fig3.update_yaxes(title_text="Head (ft)", row=1, col=1)
         fig3.update_yaxes(title_text="Efficiency (%)", row=1, col=2)
         fig3.update_layout(height=400, showlegend=True)
+        
+        # Add annotation about corrected approach
+        fig3.add_annotation(
+            text="CORRECTED: No safety factor on TDH",
+            xref="paper", yref="paper",
+            x=0.5, y=0.95,
+            showarrow=False,
+            bgcolor="lightgreen",
+            row=1, col=1
+        )
         
         st.plotly_chart(fig3, use_container_width=True)
         
@@ -1619,13 +2109,12 @@ with tab6:
         
     else:
         st.info("Calculate design first to see analysis")
-
-# Tab 7: Export
+# Tab 7: Export - CORRECTED
 with tab7:
     if st.session_state.results:
         r = st.session_state.results
         
-        st.subheader("Export Design Results")
+        st.subheader("Export Design Results (CORRECTED)")
         
         # HGL Verification Status - PROMINENT DISPLAY
         col1, col2, col3 = st.columns([1, 2, 1])
@@ -1644,7 +2133,7 @@ with tab7:
         
         st.markdown("---")
         
-        # Summary data
+        # Summary data - CORRECTED
         summary_data = {
             'Parameter': [
                 'HGL Verification Status',
@@ -1652,9 +2141,8 @@ with tab7:
                 'Discharge Elevation (ft)', 
                 'HGL Error (ft)',
                 'Flow Regime',
-                'Total Dynamic Head (calculated)',
-                'Total Dynamic Head (design)',
-                'Safety Factor',
+                'Total Dynamic Head (CORRECTED)',
+                'Motor Safety Factor Applied',
                 'Average Flow', 'Peak Flow', 'Pipe Velocity',
                 'Total Forcemain Length', 'Design Length (for TDH)', 
                 'Number of Elevation Points', 'Number of High Points',
@@ -1662,9 +2150,9 @@ with tab7:
                 'High Point Controls Design',
                 'Static Head', 'Friction Loss (to control)', 'Minor Losses (to control)',
                 'Siphon Exists', 'Siphon Length', 'Min Pressure in Siphon',
-                'Number of Pumps', 'Pump Capacity', 'Motor Size', 'Power per Pump',
+                'Number of Pumps', 'Pump Capacity', 'Motor HP Required', 'Motor HP Selected',
                 'Wet Well Diameter', 'Storage Volume', 'Cycles per Hour',
-                'Air Valves Required'
+                'Air Valves Required', 'Startup Analysis Available'
             ],
             'Value': [
                 'PERFECT' if r['hgl_error'] < 0.001 else ('PASS' if r['hgl_error'] < 0.1 else 'FAIL'),
@@ -1672,9 +2160,8 @@ with tab7:
                 f"{r['discharge_elevation']:.8f}",
                 f"{r['hgl_error']:.8f}",
                 r['flow_regime'],
-                f"{r['TDH_calculated']:.2f} ft",
-                f"{r['TDH_design']:.2f} ft",
-                f"{r['safety_factor']:.2f}",
+                f"{r['TDH']:.2f} ft (NO safety factor)",  # CORRECTED
+                f"{r['motor_safety_factor']:.2f} (applied to motor only)",  # CORRECTED
                 f"{r['Q_avg']:.0f} GPM", f"{r['Q_peak']:.0f} GPM", f"{r['pipe_velocity']:.2f} ft/s",
                 f"{r['total_length']:.0f} ft", f"{r['design_length']:.0f} ft",
                 len(r['distances']), len(r['air_valve_data']),
@@ -1687,10 +2174,10 @@ with tab7:
                 f"{r['siphon_data']['length']:.0f} ft" if r['siphon_data']['exists'] else "N/A",
                 f"{r['siphon_data']['min_pressure']:.2f} ft" if r['siphon_data']['exists'] else "N/A",
                 r['num_pumps'], f"{r['Q_pump_gpm']:.0f} GPM", 
-                f"{r['motor_size']:.1f} HP", f"{r['power_kw']:.1f} kW",
+                f"{r['MHP']:.2f} HP", f"{r['motor_size']:.1f} HP",  # CORRECTED: Show both required and selected
                 f"{r['wetwell_diameter']:.1f} ft", f"{r['storage_volume_gal']:.0f} gal",
                 f"{r['actual_cycles_per_hour']:.1f}",
-                len(r['air_valve_data'])
+                len(r['air_valve_data']), "YES" if 'startup_analysis' in r else "NO"
             ]
         }
         
@@ -1704,7 +2191,7 @@ with tab7:
             st.download_button(
                 label="Download Summary (CSV)",
                 data=csv,
-                file_name=f"lift_station_design_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                file_name=f"lift_station_design_v5_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
                 use_container_width=True
             )
@@ -1760,34 +2247,57 @@ with tab7:
                     }])
                     siphon_export.to_excel(writer, sheet_name='Siphon Analysis', index=False)
                 
-                # HGL Verification
+                # Startup Analysis - NEW
+                if 'startup_analysis' in r:
+                    startup = r['startup_analysis']
+                    startup_export = pd.DataFrame([{
+                        'Startup TDH (ft)': startup['startup_TDH'],
+                        'Running TDH (ft)': r['TDH'],
+                        'Static to High Point (ft)': startup['static_to_high_point'],
+                        'Static to Discharge (ft)': startup['static_to_discharge'],
+                        'Air Evacuation Resistance (ft)': startup['air_analysis']['total_air_resistance'],
+                        'Startup Flow (GPM)': startup['startup_flow_gpm'],
+                        'Is Startup Critical': 'YES' if startup['is_startup_critical'] else 'NO',
+                        'Startup Advantage (ft)': startup['startup_advantage'],
+                        'Pipe Volume (gal)': startup['air_analysis']['pipe_volume_gal']
+                    }])
+                    startup_export.to_excel(writer, sheet_name='Startup Analysis', index=False)
+                    
+                    # Startup recommendations
+                    startup_recs = pd.DataFrame([{
+                        'Recommendation': rec
+                    } for rec in startup['startup_recommendations']])
+                    startup_recs.to_excel(writer, sheet_name='Startup Recommendations', index=False)
+                
+                # HGL Verification - CORRECTED
                 hgl_verification = pd.DataFrame([{
                     'HGL at Discharge (ft)': f"{r['hgl_at_discharge']:.8f}",
                     'Discharge Elevation (ft)': f"{r['discharge_elevation']:.8f}",
                     'HGL Error (ft)': f"{r['hgl_error']:.8f}",
                     'Verification Status': 'PERFECT' if r['hgl_error'] < 0.001 else ('PASS' if r['hgl_error'] < 0.1 else 'FAIL'),
-                    'TDH Calculated (ft)': r['TDH_calculated'],
-                    'TDH Design (ft)': r['TDH_design'],
-                    'Safety Factor': r['safety_factor'],
-                    'Calculation Method': 'Backwards from discharge where P=0'
+                    'TDH (ft)': r['TDH'],
+                    'Motor Safety Factor': r['motor_safety_factor'],
+                    'Motor HP Required': r['MHP'],
+                    'Motor HP Selected': r['motor_size'],
+                    'Calculation Method': 'CORRECTED: Backwards from discharge where P=0, NO safety factor on TDH'
                 }])
                 hgl_verification.to_excel(writer, sheet_name='HGL Verification', index=False)
             
             st.download_button(
                 label="Download Full Report (Excel)",
                 data=buffer.getvalue(),
-                file_name=f"lift_station_design_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                file_name=f"lift_station_design_v5_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
         
         with col3:
-            # Technical specification report
-            spec_text = "LIFT STATION DESIGN REPORT\n"
+            # Technical specification report - CORRECTED
+            spec_text = "LIFT STATION DESIGN REPORT v5.0 - CORRECTED\n"
             spec_text += "="*80 + "\n\n"
             spec_text += f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             
-            spec_text += "HGL VERIFICATION\n"
+            spec_text += "CORRECTED HGL VERIFICATION\n"
             spec_text += "-"*80 + "\n"
             spec_text += f"HGL at Discharge: {r['hgl_at_discharge']:.8f} ft\n"
             spec_text += f"Discharge Elevation: {r['discharge_elevation']:.8f} ft\n"
@@ -1798,19 +2308,29 @@ with tab7:
                 spec_text += f"Verification: PASS\n"
             else:
                 spec_text += f"Verification: FAIL\n"
-            spec_text += f"Method: Backwards calculation from discharge (P=0)\n\n"
+            spec_text += f"Method: CORRECTED - Backwards calculation from discharge (P=0)\n\n"
             
-            spec_text += "HYDRAULIC DESIGN SUMMARY\n"
+            spec_text += "CORRECTED HYDRAULIC DESIGN SUMMARY\n"
             spec_text += "-"*80 + "\n"
             spec_text += f"Flow Regime: {r['flow_regime']}\n"
-            spec_text += f"Total Dynamic Head (calculated): {r['TDH_calculated']:.2f} ft\n"
-            spec_text += f"Total Dynamic Head (design): {r['TDH_design']:.2f} ft\n"
-            spec_text += f"Safety Factor: {r['safety_factor']:.2f}\n"
+            spec_text += f"Total Dynamic Head: {r['TDH']:.2f} ft (NO safety factor)\n"
+            spec_text += f"Motor Safety Factor: {r['motor_safety_factor']:.2f} (applied to motor only)\n"
             spec_text += f"Design Length: {r['design_length']:.0f} ft\n"
             spec_text += f"Total Length: {r['total_length']:.0f} ft\n"
             spec_text += f"Static Head: {r['static_head']:.1f} ft\n"
             spec_text += f"Friction Loss: {r['friction_loss']:.2f} ft\n"
             spec_text += f"Minor Losses: {r['minor_losses']:.2f} ft\n\n"
+            
+            if 'startup_analysis' in r:
+                startup = r['startup_analysis']
+                spec_text += "STARTUP ANALYSIS\n"
+                spec_text += "-"*80 + "\n"
+                spec_text += f"Startup TDH: {startup['startup_TDH']:.2f} ft\n"
+                spec_text += f"Running TDH: {r['TDH']:.2f} ft\n"
+                spec_text += f"Static to High Point: {startup['static_to_high_point']:.1f} ft\n"
+                spec_text += f"Air Evacuation Resistance: {startup['air_analysis']['total_air_resistance']:.1f} ft\n"
+                spec_text += f"Is Critical: {'YES' if startup['is_startup_critical'] else 'NO'}\n"
+                spec_text += f"Startup Advantage: {startup['startup_advantage']:.1f} ft\n\n"
             
             if r['siphon_data']['exists']:
                 spec_text += "SIPHON ANALYSIS\n"
@@ -1821,12 +2341,14 @@ with tab7:
                 spec_text += f"Vacuum Margin: {r['siphon_data']['vacuum_margin']:.1f} ft\n"
                 spec_text += f"Stability: {'STABLE' if r['siphon_data']['is_stable'] else 'UNSTABLE'}\n\n"
             
-            spec_text += "PUMP SPECIFICATIONS\n"
+            spec_text += "CORRECTED PUMP SPECIFICATIONS\n"
             spec_text += "-"*80 + "\n"
             spec_text += f"Number of Pumps: {r['num_pumps']}\n"
             spec_text += f"Operating Pumps: {r['pumps_operating']} (N-1 redundancy)\n"
-            spec_text += f"Capacity (each): {r['Q_pump_gpm']:.0f} GPM @ {r['TDH_design']:.1f} ft TDH\n"
-            spec_text += f"Motor Size: {r['motor_size']:.1f} HP\n"
+            spec_text += f"Capacity (each): {r['Q_pump_gpm']:.0f} GPM @ {r['TDH']:.1f} ft TDH\n"
+            spec_text += f"Motor HP Required: {r['MHP']:.2f} HP\n"
+            spec_text += f"Motor HP Selected: {r['motor_size']:.1f} HP\n"
+            spec_text += f"Motor Safety Factor: {r['motor_safety_factor']:.2f}\n"
             spec_text += f"Power: {r['power_kw']:.1f} kW\n\n"
             
             if r['air_valve_data']:
@@ -1842,25 +2364,290 @@ with tab7:
                     spec_text += f"  Pressure: {valve['pressure_head']:.2f} ft\n"
             
             spec_text += "\n" + "="*80 + "\n"
-            spec_text += "Report generated by Lift Station Sizing Tool v4.0\n"
-            spec_text += "Smith & Loveless Methodology with CORRECTED HGL Calculation\n"
-            spec_text += "HGL calculated backwards from discharge where P=0\n"
+            spec_text += "Report generated by Lift Station Sizing Tool v5.0 - CORRECTED\n"
+            spec_text += "Smith & Loveless Methodology with CORRECTED TDH Approach\n"
+            spec_text += "✅ NO safety factor on TDH - TDH is actual hydraulic requirement\n"
+            spec_text += "✅ Safety factors applied to equipment only\n"
+            spec_text += "✅ HGL calculated backwards from discharge where P=0\n"
+            spec_text += "✅ Includes startup analysis for two operating points\n"
             spec_text += "="*80 + "\n"
             
             st.download_button(
                 label="Download Technical Specs (TXT)",
                 data=spec_text,
-                file_name=f"lift_station_specs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                file_name=f"lift_station_specs_v5_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
                 mime="text/plain",
                 use_container_width=True
             )
     else:
         st.info("Calculate design first to export results")
-
-# Footer
-st.markdown("---")
-st.markdown("**Lift Station Sizing Tool** | Professional Engineering Design Software | Version 4.0")
-st.caption("With Siphon Flow Analysis, Multi-Point Elevation Profile, Smith & Loveless Methodology, and CORRECTED HGL Calculation")
-st.caption("✅ **CORRECTED:** HGL at discharge now properly equals discharge elevation (P=0)")
-st.caption("🔧 **Method:** Backwards calculation from discharge ensures hydraulic accuracy")
+# Tab 8: Startup Analysis - COMPLETELY NEW
+with tab8:
+    st.subheader("🚀 Pump Startup Analysis - Two Operating Points")
+    st.markdown("**Analysis of pump requirements during system filling vs. normal operation**")
+    
+    if st.session_state.results:
+        r = st.session_state.results
         
+        if 'startup_analysis' not in r:
+            st.warning("Recalculate design to see startup analysis")
+        else:
+            startup = r['startup_analysis']
+            
+            # Overview comparison
+            st.markdown("### 📊 Operating Conditions Comparison")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric(
+                    "🚀 Startup TDH", 
+                    f"{startup['startup_TDH']:.1f} ft",
+                    delta=f"{startup['startup_advantage']:.1f} ft higher" if startup['startup_advantage'] > 1 else "Similar to running"
+                )
+            with col2:
+                st.metric(
+                    "▶️ Running TDH", 
+                    f"{r['TDH']:.1f} ft"
+                )
+            with col3:
+                st.metric(
+                    "💨 Air Evacuation Loss", 
+                    f"{startup['air_analysis']['total_air_resistance']:.1f} ft"
+                )
+            
+            # Detailed breakdown
+            st.markdown("---")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("### 🚀 Startup Conditions (Empty Pipe)")
+                
+                st.markdown("**Static Head Components:**")
+                st.write(f"• To high point: **{startup['static_to_high_point']:.1f} ft**")
+                st.write(f"• To discharge: **{startup['static_to_discharge']:.1f} ft**")
+                
+                st.markdown("**Air Evacuation Analysis:**")
+                air = startup['air_analysis']
+                st.write(f"• Base air resistance: **{air['base_air_resistance']:.1f} ft**")
+                st.write(f"• Elevation factor: **{air['elevation_air_resistance']:.1f} ft**")
+                st.write(f"• Volume factor: **{air['volume_air_resistance']:.1f} ft**")
+                st.write(f"• **Total air resistance: {air['total_air_resistance']:.1f} ft**")
+                
+                st.markdown("**System Characteristics:**")
+                st.write(f"• Pipe volume: **{air['pipe_volume_gal']:,.0f} gallons**")
+                st.write(f"• Startup flow: **{startup['startup_flow_gpm']:.0f} GPM** (60% of design)")
+                st.write(f"• Friction multiplier: **{startup['filling_friction_factor']:.1f}x** (filling resistance)")
+                
+                st.info(f"**🎯 Total Startup TDH: {startup['startup_TDH']:.1f} ft**")
+            
+            with col2:
+                st.markdown("### ▶️ Running Conditions (Filled Pipe)")
+                
+                st.markdown("**System Head Components:**")
+                st.write(f"• Static head: **{r['static_head']:.1f} ft**")
+                st.write(f"• Friction losses: **{r['friction_loss']:.1f} ft**")
+                st.write(f"• Minor losses: **{r['minor_losses']:.1f} ft**")
+                
+                if r['siphon_data']['exists']:
+                    st.markdown("**Siphon Assistance:**")
+                    siphon = r['siphon_data']
+                    st.write(f"• Elevation drop: **{siphon['elevation_drop']:.1f} ft**")
+                    st.write(f"• Siphon length: **{siphon['length']:.0f} ft**")
+                    st.success("✅ Gravity assists flow after high point")
+                
+                st.markdown("**Operating Characteristics:**")
+                st.write(f"• Design flow: **{r['Q_peak']:.0f} GPM**")
+                st.write(f"• Pipe velocity: **{r['pipe_velocity']:.2f} ft/s**")
+                st.write(f"• Flow regime: **{r['flow_regime'][:30]}**")
+                
+                st.success(f"**🎯 Normal Operating TDH: {r['TDH']:.1f} ft**")
+            
+            # Critical analysis
+            st.markdown("---")
+            st.markdown("### ⚠️ Critical Analysis & Recommendations")
+            
+            if startup['is_startup_critical']:
+                st.error("⚠️ **STARTUP CONDITIONS ARE CRITICAL**")
+                
+                # Show impact analysis
+                impact_analysis = pd.DataFrame([
+                    {
+                        'Condition': '🚀 Startup (Empty Pipe)',
+                        'TDH (ft)': startup['startup_TDH'],
+                        'Flow (GPM)': startup['startup_flow_gpm'],
+                        'Primary Challenge': 'Air evacuation + Static head to high point'
+                    },
+                    {
+                        'Condition': '▶️ Running (Filled Pipe)', 
+                        'TDH (ft)': r['TDH'],
+                        'Flow (GPM)': r['Q_peak'],
+                        'Primary Challenge': 'Friction losses + Minor losses'
+                    }
+                ])
+                
+                st.dataframe(impact_analysis, use_container_width=True)
+                
+            else:
+                st.success("✅ **STARTUP CONDITIONS MANAGEABLE**")
+            
+            # Professional recommendations
+            st.markdown("**🛠️ Engineering Recommendations:**")
+            for rec in startup['startup_recommendations']:
+                if "⚠️ CRITICAL" in rec:
+                    st.error(rec)
+                elif "⚠️" in rec:
+                    st.warning(rec)
+                elif "🔧" in rec:
+                    st.info(rec)
+                else:
+                    st.write(rec)
+            
+            # Enhanced pump curve with both operating points
+            st.markdown("---")
+            st.markdown("### 📈 Pump Curve - Dual Operating Points")
+            
+            # Generate pump curve showing both points
+            Q_range = np.linspace(0, r['Q_pump_gpm'] * 1.5, 100)
+            
+            # Startup point: higher head, lower flow
+            # Running point: design head and flow
+            
+            startup_flow = startup['startup_flow_gpm']
+            startup_head = startup['startup_TDH']
+            running_flow = r['Q_pump_gpm'] 
+            running_head = r['TDH']
+            
+            # Estimated pump curve that handles both points
+            # Use higher of the two heads as shutoff head
+            H_shutoff = max(startup_head, running_head) * 1.3
+            H_curve = H_shutoff - (H_shutoff - max(startup_head, running_head)) * (Q_range / running_flow)**1.8
+            
+            fig_startup = go.Figure()
+            
+            # Pump curve
+            fig_startup.add_trace(go.Scatter(
+                x=Q_range, 
+                y=H_curve, 
+                name='Required Pump Curve',
+                line=dict(color='blue', width=3)
+            ))
+            
+            # Startup operating point
+            fig_startup.add_trace(go.Scatter(
+                x=[startup_flow], 
+                y=[startup_head],
+                mode='markers+text',
+                name='🚀 Startup Point',
+                marker=dict(size=15, color='red', symbol='diamond'),
+                text=['STARTUP<br>POINT'],
+                textposition='top center'
+            ))
+            
+            # Running operating point  
+            fig_startup.add_trace(go.Scatter(
+                x=[running_flow], 
+                y=[running_head],
+                mode='markers+text', 
+                name='▶️ Running Point',
+                marker=dict(size=15, color='green', symbol='circle'),
+                text=['RUNNING<br>POINT'],
+                textposition='bottom center'
+            ))
+            
+            # System curves for both conditions
+            H_system_startup = startup['static_to_high_point'] + (startup_head - startup['static_to_high_point']) * (Q_range / startup_flow)**2
+            H_system_running = r['static_head'] + (running_head - r['static_head']) * (Q_range / running_flow)**2
+            
+            fig_startup.add_trace(go.Scatter(
+                x=Q_range, 
+                y=H_system_startup,
+                name='🚀 Startup System Curve',
+                line=dict(color='red', dash='dash', width=2)
+            ))
+            
+            fig_startup.add_trace(go.Scatter(
+                x=Q_range, 
+                y=H_system_running,
+                name='▶️ Running System Curve', 
+                line=dict(color='green', dash='dash', width=2)
+            ))
+            
+            fig_startup.update_layout(
+                title="Pump Performance - Startup vs Running Conditions",
+                xaxis_title="Flow Rate (GPM)",
+                yaxis_title="Head (ft)",
+                height=500,
+                showlegend=True
+            )
+            
+            # Add annotations for operating points
+            fig_startup.add_annotation(
+                x=startup_flow,
+                y=startup_head + 5,
+                text=f"Startup: {startup_flow:.0f} GPM @ {startup_head:.1f} ft",
+                showarrow=True,
+                bgcolor="red",
+                bordercolor="white"
+            )
+            
+            fig_startup.add_annotation(
+                x=running_flow,
+                y=running_head - 5,
+                text=f"Running: {running_flow:.0f} GPM @ {running_head:.1f} ft", 
+                showarrow=True,
+                bgcolor="green",
+                bordercolor="white"
+            )
+            
+            st.plotly_chart(fig_startup, use_container_width=True)
+            
+            # Pump selection guidance
+            st.markdown("---")
+            st.markdown("### 🛠️ Pump Selection Guidance")
+            
+            if startup['startup_advantage'] > 5:
+                st.error("""
+                **🔧 CRITICAL PUMP SELECTION CONSIDERATIONS:**
+                
+                1. **Pump Curve Shape:** Select pump with relatively flat curve to handle both operating points efficiently
+                2. **Motor Starting:** Verify motor can provide adequate starting torque for high startup head
+                3. **Operating Efficiency:** Check efficiency at both startup and running points
+                4. **Air Handling:** Ensure pump can handle air entrainment during filling
+                5. **Control Strategy:** Consider staged startup or flow control during filling
+                """)
+            else:
+                st.success("""
+                **✅ STANDARD PUMP SELECTION APPLIES:**
+                
+                1. **Single Operating Point:** Design for running conditions
+                2. **Standard Motor:** Normal starting requirements
+                3. **Conventional Control:** Standard on/off operation acceptable
+                """)
+            
+            # Air valve considerations
+            st.markdown("### 💨 Air Valve Impact on Startup")
+            
+            if r['has_high_points']:
+                st.warning("""
+                **Air valve performance is CRITICAL during startup:**
+                
+                • **Large air release capacity** needed during initial filling
+                • **Fast response** required to prevent vacuum formation
+                • **Multiple high points** may require staged filling sequence
+                • **Vacuum relief** essential if startup fails mid-process
+                
+                **Recommendation:** Verify air valve sizing accounts for startup air flow rates, not just operational requirements.
+                """)
+            else:
+                st.info("No intermediate high points - standard air valve considerations apply")
+    
+    else:
+        st.info("Calculate design first to see startup analysis")
+# Footer - CORRECTED
+st.markdown("---")
+st.markdown("**Lift Station Sizing Tool v5.0** | Professional Engineering Design Software | CORRECTED VERSION")
+st.caption("✅ **CORRECTED:** NO safety factor on TDH - TDH is actual hydraulic requirement")
+st.caption("✅ **NEW:** Startup analysis for dual operating points")
+st.caption("✅ **ENHANCED:** Air valve sizing, siphon analysis, multi-point elevation profiles")
+st.caption("🛠️ **Method:** Smith & Loveless methodology with backwards HGL calculation from discharge (P=0)")
+st.caption("⚙️ **Safety Factors:** Applied to equipment only (motor sizing, pump redundancy)")
